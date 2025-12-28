@@ -34,7 +34,12 @@ if PUBLIC_CHANNEL_ID_RAW.startswith("@"):
 else:
     # If it's a numeric ID, convert to int. Handle -100 prefix if needed.
     try:
-        PUBLIC_CHANNEL_ID = int(PUBLIC_CHANNEL_ID_RAW)
+        # Most channels have -100 prefix. If user just gave the tail, add it.
+        clean_id = str(PUBLIC_CHANNEL_ID_RAW).strip()
+        if not clean_id.startswith("-"):
+             if len(clean_id) > 5: # likely a channel tail
+                 clean_id = "-100" + clean_id
+        PUBLIC_CHANNEL_ID = int(clean_id)
     except ValueError:
         PUBLIC_CHANNEL_ID = PUBLIC_CHANNEL_ID_RAW
 TELEGRAM_HANDLE = (os.getenv("TELEGRAM_HANDLE") or "@CtrlAltBG").strip()
@@ -104,11 +109,11 @@ def google_news_rss(q: str) -> str:
     return f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=bg&gl=BG&ceid=BG:bg"
 
 RSS_FEEDS = [
-    ("Fakti.bg", "https://fakti.bg/rss/all"),
-    ("BTA Bulgaria", "https://www.bta.bg/bg/rss/bulgaria"),
-    ("BNT News", "https://bntnews.bg/rss/news.xml"),
+    ("Fakti.bg", "https://fakti.bg/feed"),
+    ("BTA Bulgaria", "https://www.bta.bg/bg/rss/free"),
+    ("BNT News", "https://bntnews.bg/bg/rss/news.xml"),
     ("Actualno Politics", "https://www.actualno.com/rss/politics"),
-    ("24 Chasa", "https://www.24chasa.bg/rss/novini/bulgaria"),
+    ("24 Chasa", "https://www.24chasa.bg/rss"),
     ("Capital Bulgaria", "https://www.capital.bg/rss/?section=bulgaria"),
     ("Novini.bg via Google", google_news_rss("site:novini.bg")),
     ("News.bg via Google", google_news_rss("site:news.bg")),
@@ -157,7 +162,21 @@ HOT_TERMS = [
 ]
 
 def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").lower())
+    # Remove punctuation and extra whitespace
+    text = re.sub(r"[^\w\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+def get_title_keywords(title: str) -> set[str]:
+    # Extract unique words longer than 2 characters
+    words = normalize(title).split()
+    return {w for w in words if len(w) > 2}
+
+def calc_similarity(title1: str, title2: str) -> float:
+    set1 = get_title_keywords(title1)
+    set2 = get_title_keywords(title2)
+    if not set1 or not set2: return 0.0
+    intersection = set1.intersection(set2)
+    return len(intersection) / min(len(set1), len(set2))
 
 def score_entry(title: str, summary: str) -> int:
     text = normalize((title or "") + " " + (summary or ""))
@@ -215,6 +234,7 @@ def fetch_article_image(article_url: str) -> str:
     if not u:
         return ""
     try:
+        print(f"[IMG] Fetching image from {u}...", flush=True)
         resp = requests.get(
             u,
             timeout=15,
@@ -230,14 +250,28 @@ def fetch_article_image(article_url: str) -> str:
         m = META_OG_IMAGE_RE.search(html_text) or META_OG_IMAGE_ALT_RE.search(html_text)
         if m:
             img = (m.group(1) or "").strip()
-            if img: return urljoin(u, img)
+            if img: 
+                print(f"[IMG] Found OG/Twitter image: {img}", flush=True)
+                return urljoin(u, img)
+
+        # JSON-LD check (Capital.bg etc often use this)
+        # Look for "image": "..." inside script tags
+        json_ld_images = re.findall(r'["\']image["\']\s*:\s*["\']([^"\']+)["\']', html_text, re.I)
+        if json_ld_images:
+            for jimg in json_ld_images:
+                if is_usable_image(jimg):
+                    print(f"[IMG] Found JSON-LD image: {jimg}", flush=True)
+                    return urljoin(u, jimg)
 
         m2 = IMG_SRC_RE.search(html_text)
         if m2:
             img = (m2.group(1) or "").strip()
-            if img: return urljoin(u, img)
-    except Exception:
-        pass
+            if img: 
+                print(f"[IMG] Found fallback <img>: {img}", flush=True)
+                return urljoin(u, img)
+        print("[IMG] No usable image tags found.", flush=True)
+    except Exception as e:
+        print(f"[IMG] Error during image fetch: {e}", flush=True)
     return ""
 
 def is_usable_image(image_url: str) -> bool:
@@ -284,7 +318,16 @@ def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, text TEXT, status TEXT, error TEXT, image_url TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS posted (item_id TEXT PRIMARY KEY, posted_at TEXT)")
+    
+    # Updated posted table with title_norm for deduplication
+    c.execute("CREATE TABLE IF NOT EXISTS posted (item_id TEXT PRIMARY KEY, posted_at TEXT, title_norm TEXT)")
+    
+    # Simple migration: add title_norm if it doesn't exist
+    try:
+        c.execute("ALTER TABLE posted ADD COLUMN title_norm TEXT")
+    except sqlite3.OperationalError:
+        pass # column already exists
+        
     c.execute("CREATE TABLE IF NOT EXISTS failures (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, source TEXT, item_id TEXT, stage TEXT, error TEXT)")
     conn.commit()
     return conn
@@ -294,8 +337,25 @@ def already_posted(conn: sqlite3.Connection, item_id: str) -> bool:
     c.execute("SELECT 1 FROM posted WHERE item_id=?", (item_id,))
     return c.fetchone() is not None
 
-def mark_posted(conn: sqlite3.Connection, item_id: str) -> None:
-    conn.execute("INSERT OR IGNORE INTO posted (item_id, posted_at) VALUES (?, ?)", (item_id, utc_now_iso()))
+def is_duplicate_story(conn: sqlite3.Connection, new_title: str, threshold: float = 0.6) -> bool:
+    # Check for similar titles in the last 48 hours
+    c = conn.cursor()
+    # We use a date filter to keep it fast
+    two_days_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 172800))
+    c.execute("SELECT title_norm FROM posted WHERE posted_at > ?", (two_days_ago,))
+    rows = c.fetchall()
+    
+    for (old_title,) in rows:
+        if not old_title: continue
+        if calc_similarity(new_title, old_title) >= threshold:
+            return True
+    return False
+
+def mark_posted(conn: sqlite3.Connection, item_id: str, title: str = "") -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO posted (item_id, posted_at, title_norm) VALUES (?, ?, ?)", 
+        (item_id, utc_now_iso(), normalize(title))
+    )
     conn.commit()
 
 def save_draft(conn: sqlite3.Connection, msg_html: str, status: str = "pending", image_url: str = "") -> int:
@@ -314,17 +374,36 @@ def hard_clip(text: str, max_len: int = 3800) -> str:
 
 async def publish_to_channel(bot, chat_id: int, text: str, image_url: str = "") -> None:
     image_url = (image_url or "").strip()
+    photo_sent = False
+    
     if image_url:
         try:
+            print(f"[PUB] Sending photo to {chat_id}: {image_url}", flush=True)
             await bot.send_photo(chat_id=chat_id, photo=image_url)
-        except Exception:
+            photo_sent = True
+        except Exception as e:
+            print(f"[PUB] send_photo by URL failed: {e}. Trying download...", flush=True)
             try:
                 data, fname = download_image_bytes(image_url)
                 await bot.send_photo(chat_id=chat_id, photo=InputFile(BytesIO(data), filename=fname))
-            except Exception:
-                pass
+                photo_sent = True
+            except Exception as e2:
+                print(f"[PUB] send_photo by bytes also failed: {e2}", flush=True)
 
-    await bot.send_message(chat_id=chat_id, text=hard_clip(text, 3900), parse_mode=ParseMode.HTML, disable_web_page_preview=DISABLE_PREVIEWS)
+    # If we sent a standalone photo, we DISABLE the link preview in the text message to avoid duplicates.
+    # If we DID NOT send a photo, we ENABLE the link preview so Telegram's auto-parser can try to find one.
+    should_disable_preview = photo_sent or DISABLE_PREVIEWS
+    
+    # Force enable preview if no photo was sent to maximize chances of having a picture
+    if not photo_sent:
+        should_disable_preview = False
+
+    await bot.send_message(
+        chat_id=chat_id, 
+        text=hard_clip(text, 3900), 
+        parse_mode=ParseMode.HTML, 
+        disable_web_page_preview=should_disable_preview
+    )
 
 def build_message_html(headline: str, summary: str, details: str, source: str, link: str, hashtags: list[str]) -> str:
     h = html.escape(headline.strip())
@@ -418,10 +497,13 @@ async def run_rss_once(app: Application) -> None:
     client: OpenAI = app.bot_data["openai_client"]
     conn: sqlite3.Connection = app.bot_data["db_conn"]
     
+    print(f"\n[RSS] Starting scheduled scan at {time.strftime('%H:%M:%S')}...", flush=True)
     candidates = []
     for source, url in RSS_FEEDS:
         try:
+            print(f"[RSS] Checking {source}...", flush=True)
             feed = fetch_feed(url)
+            found_in_feed = 0
             for entry in (feed.entries or [])[:PER_FEED_CAP]:
                 title = entry.get("title", "")
                 summ = entry.get("summary", "") or entry.get("description", "")
@@ -429,33 +511,53 @@ async def run_rss_once(app: Application) -> None:
                 item_id = extract_item_id(entry)
                 
                 if item_id and not already_posted(conn, item_id):
+                    if is_duplicate_story(conn, title):
+                        continue
+                    
                     score = score_entry(title, summ)
                     if score >= MIN_SCORE:
                         candidates.append((score, source, title, summ, link, item_id))
+                        found_in_feed += 1
+            if found_in_feed > 0:
+                print(f"[RSS]   --> {found_in_feed} new candidates found in {source}", flush=True)
         except Exception as e:
-            print(f"Error fetching {source}: {e}")
+            print(f"[RSS]   [!] Error fetching {source}: {e}", flush=True)
 
+    print(f"[RSS] Scan complete. Total candidates found: {len(candidates)}", flush=True)
     candidates.sort(key=lambda x: x[0], reverse=True)
     
-    for s, source, title, summ, link, item_id in candidates[:MAX_PER_RUN]:
+    to_process = candidates[:MAX_PER_RUN]
+    if to_process:
+        print(f"[RSS] High-score candidates selected for processing: {len(to_process)}", flush=True)
+    else:
+        print("[RSS] No high-score candidates to process in this run.", flush=True)
+
+    for s, source, title, summ, link, item_id in to_process:
         try:
+            print(f"[BOT] Processing: \"{title[:50]}...\" from {source}", flush=True)
             image_url = fetch_article_image(link)
             if image_url and not is_usable_image(image_url):
+                print(f"[BOT] Image discarded (filtered): {image_url}", flush=True)
                 image_url = ""
                 
+            print("[AI] Requesting Bulgarian summary from OpenAI...", flush=True)
             msg_html = generate_post(client, source, title, summ, link, detect_article_type(source, title, link))
             
             if AUTO_POST:
+                print("[BOT] AUTO_POST enabled. Publishing to channel...", flush=True)
                 await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url)
                 save_draft(conn, msg_html, status="posted", image_url=image_url)
+                print("[BOT] Successfully posted to channel.", flush=True)
             else:
                 draft_id = save_draft(conn, msg_html, status="pending", image_url=image_url)
+                print(f"[BOT] Draft #{draft_id} saved. Sending to editor chat...", flush=True)
                 editor_msg = f"<b>Нова чернова #{draft_id}</b>\n\n{msg_html}\n\n/post {draft_id} | /skip {draft_id}"
                 await bot.send_message(chat_id=EDITOR_CHAT_ID, text=editor_msg, parse_mode=ParseMode.HTML)
+                print(f"[BOT] Notification sent to editor (ID: {EDITOR_CHAT_ID})", flush=True)
                 
-            mark_posted(conn, item_id)
+            mark_posted(conn, item_id, title)
         except Exception as ex:
-            print(f"Processing error: {ex}")
+            print(f"[BOT] [!] Critical processing error: {ex}", flush=True)
             traceback.print_exc()
 
 async def rss_job(context: ContextTypes.DEFAULT_TYPE):
@@ -491,11 +593,23 @@ async def post_init(app: Application):
     await app.bot.send_message(chat_id=EDITOR_CHAT_ID, text="🤖 Ботът за български новини е стартиран!")
 
 def main():
+    print("--- [STARTUP] ---", flush=True)
+    print(f"[STARTUP] Initializing Bulgarian News Bot...", flush=True)
     acquire_lock_or_exit()
+    print("[STARTUP] Lock acquired.", flush=True)
+
+    if not BOT_TOKEN:
+        print("[STARTUP] [!] ERROR: BOT_TOKEN is missing in .env!", flush=True)
+        return
+
+    print(f"[STARTUP] Building application with token: {BOT_TOKEN[:8]}...", flush=True)
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    
     app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("run", lambda u, c: run_rss_once(c.application)))
+    
+    print("[STARTUP] Bot is now polling for updates. Press Ctrl+C to stop.", flush=True)
     app.run_polling()
 
 if __name__ == "__main__":

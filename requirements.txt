@@ -2,4 +2,5 @@ requests
 feedparser
 python-dotenv
 openai
-python-telegram-bot
+python-telegram-bot[job-queue]
+urllib3<2.0
