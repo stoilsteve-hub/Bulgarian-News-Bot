@@ -537,26 +537,26 @@ async def run_rss_once(app: Application) -> None:
     print(f"[RSS] Scan complete. Total candidates found: {len(candidates)}", flush=True)
     candidates.sort(key=lambda x: x[0], reverse=True)
     
-    to_process = candidates[:MAX_PER_RUN]
-    if to_process:
-        print(f"[RSS] High-score candidates selected for processing: {len(to_process)}", flush=True)
-    else:
-        print("[RSS] No high-score candidates to process in this run.", flush=True)
+    processed_count = 0
+    for s, source, title, summ, link, item_id in candidates[:20]: # Check up to 20 candidates to find matches
+        if processed_count >= MAX_PER_RUN:
+            break
 
-    for s, source, title, summ, link, item_id in to_process:
         try:
-            print(f"[BOT] Processing: \"{title[:50]}...\" from {source}", flush=True)
+            print(f"[BOT] Processing candidate (Score: {s}): \"{title[:50]}...\" from {source}", flush=True)
+            
+            # AI Check & Generate
+            msg_html = generate_post(client, source, title, summ, link, detect_article_type(source, title, link))
+            
+            if msg_html == "SKIP":
+                mark_posted(conn, item_id, title)
+                continue # Try next candidate in the same run
+
+            # If we reached here, AI approved it
             image_url = fetch_article_image(link)
             if image_url and not is_usable_image(image_url):
                 print(f"[BOT] Image discarded (filtered): {image_url}", flush=True)
                 image_url = ""
-                
-            print("[AI] Requesting Bulgarian summary from OpenAI...", flush=True)
-            msg_html = generate_post(client, source, title, summ, link, detect_article_type(source, title, link))
-            
-            if msg_html == "SKIP":
-                mark_posted(conn, item_id, title) # Mark as seen so we don't try again
-                continue
 
             if AUTO_POST:
                 print("[BOT] AUTO_POST enabled. Publishing to channel...", flush=True)
@@ -571,6 +571,8 @@ async def run_rss_once(app: Application) -> None:
                 print(f"[BOT] Notification sent to editor (ID: {EDITOR_CHAT_ID})", flush=True)
                 
             mark_posted(conn, item_id, title)
+            processed_count += 1
+            
         except Exception as ex:
             print(f"[BOT] [!] Critical processing error: {ex}", flush=True)
             traceback.print_exc()
