@@ -374,35 +374,44 @@ def hard_clip(text: str, max_len: int = 3800) -> str:
 
 async def publish_to_channel(bot, chat_id: int, text: str, image_url: str = "") -> None:
     image_url = (image_url or "").strip()
-    photo_sent = False
+    text = hard_clip(text, 3900)
     
+    # Telegram captions have a limit of 1024 characters.
+    # If our text is short enough, we send the photo WITH the text as a caption.
+    # This creates a single clean post without "Link Preview" junk.
+    if image_url and len(text) < 1024:
+        try:
+            print(f"[PUB] Sending photo with caption to {chat_id}", flush=True)
+            await bot.send_photo(
+                chat_id=chat_id, 
+                photo=image_url, 
+                caption=text, 
+                parse_mode=ParseMode.HTML
+            )
+            return # Done
+        except Exception as e:
+            print(f"[PUB] send_photo with caption failed: {e}. Falling back to separate messages.", flush=True)
+
+    # Fallback/Default: Send photo and message separately
+    photo_sent = False
     if image_url:
         try:
-            print(f"[PUB] Sending photo to {chat_id}: {image_url}", flush=True)
             await bot.send_photo(chat_id=chat_id, photo=image_url)
             photo_sent = True
         except Exception as e:
-            print(f"[PUB] send_photo by URL failed: {e}. Trying download...", flush=True)
             try:
                 data, fname = download_image_bytes(image_url)
                 await bot.send_photo(chat_id=chat_id, photo=InputFile(BytesIO(data), filename=fname))
                 photo_sent = True
-            except Exception as e2:
-                print(f"[PUB] send_photo by bytes also failed: {e2}", flush=True)
+            except: pass
 
-    # If we sent a standalone photo, we DISABLE the link preview in the text message to avoid duplicates.
-    # If we DID NOT send a photo, we ENABLE the link preview so Telegram's auto-parser can try to find one.
-    should_disable_preview = photo_sent or DISABLE_PREVIEWS
-    
-    # Force enable preview if no photo was sent to maximize chances of having a picture
-    if not photo_sent:
-        should_disable_preview = False
-
+    # For the text message, we ALWAYS disable the web page preview if we already have a photo
+    # OR if the user wants it off. This removes that extra text you didn't like.
     await bot.send_message(
         chat_id=chat_id, 
-        text=hard_clip(text, 3900), 
+        text=text, 
         parse_mode=ParseMode.HTML, 
-        disable_web_page_preview=should_disable_preview
+        disable_web_page_preview=True # Keep it clean
     )
 
 def build_message_html(headline: str, summary: str, details: str, source: str, link: str, hashtags: list[str]) -> str:
