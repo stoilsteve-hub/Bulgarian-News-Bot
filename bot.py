@@ -448,7 +448,12 @@ def generate_post(client: OpenAI, source: str, title: str, summary_raw: str, lin
 - Пиши само на български език.
 - Използвай емотикони за заглавието.
 - Направи новината да звучи важно и интересно (сензационно).
-- ВИНАГИ връщай 4 блока с етикети: HEADLINE, SUMMARY, DETAILS, HASHTAGS.
+
+РЕЛАВАНТНОСТ:
+Новината трябва да е за БЪЛГАРИЯ или за една от следните теми: ВОЙНА, РУСИЯ, УКРАЙНА, ТРЪМП.
+Ако новината НЕ Е за България и НЕ Е за някоя от тези теми, върни само думата SKIP.
+
+Ако новината е релевантна, ВИНАГИ връщай EXACTLY 4 блока с етикети: HEADLINE, SUMMARY, DETAILS, HASHTAGS.
 
 HEADLINE: 1 изречение, закачливо заглавие с емоджи.
 SUMMARY: 2-3 изречения, основната същност.
@@ -473,6 +478,11 @@ HASHTAGS: 4-6 релевантни хештага.
     )
     
     content = r.choices[0].message.content or ""
+    
+    if content.strip().upper() == "SKIP":
+        print(f"[AI] Discarding irrelevant news (not Bulgaria/War/Russia/Ukraine/Trump).", flush=True)
+        return "SKIP"
+
     if not is_bulgarian_enough(content):
         raise ValueError("AI output is not primarily Bulgarian.")
 
@@ -543,6 +553,10 @@ async def run_rss_once(app: Application) -> None:
             print("[AI] Requesting Bulgarian summary from OpenAI...", flush=True)
             msg_html = generate_post(client, source, title, summ, link, detect_article_type(source, title, link))
             
+            if msg_html == "SKIP":
+                mark_posted(conn, item_id, title) # Mark as seen so we don't try again
+                continue
+
             if AUTO_POST:
                 print("[BOT] AUTO_POST enabled. Publishing to channel...", flush=True)
                 await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url)
