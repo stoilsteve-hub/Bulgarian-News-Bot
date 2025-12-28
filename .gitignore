@@ -1,0 +1,14 @@
+.env
+*.sqlite
+*.sqlite3
+.bot.lock
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.DS_Store
