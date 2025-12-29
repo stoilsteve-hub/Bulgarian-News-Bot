@@ -119,7 +119,7 @@ RSS_FEEDS = [
     ("News.bg via Google", google_news_rss("site:news.bg")),
     ("Vesti.bg via Google", google_news_rss("site:vesti.bg")),
     ("BTV Novinite via Google", google_news_rss("site:btvnovinite.bg")),
-    ("Nova News via Google", google_news_rss("site:nova.bg/novanews")),
+    ("Nova News via Google", google_news_rss("site:nova.bg")),
     ("Darik Regions via Google", google_news_rss("site:dariknews.bg/regioni")),
     ("Telegraph via Google", google_news_rss("site:telegraph.bg")),
     ("Standart via Google", google_news_rss("site:standartnews.com")),
@@ -159,7 +159,10 @@ KEYWORDS = [
     "транспорт", "задръстване", "влак", "автобус", "пътна обстановка", "магистрала",
     "лична история", "трагедия", "съдба", "помощ", "дарение", "болест", "лечение",
     "арест", "полиция", "МВР", "акция", "разследване", "затвор", "престъпление",
-    "корупция", "подкуп", "далавера", "злоупотреба", "кражба", "измама"
+    "корупция", "подкуп", "далавера", "злоупотреба", "кражба", "измама",
+    # Global / Weather
+    "Запад", "САЩ", "Тръмп", "Путин", "Русия", "Украйна",
+    "буря", "ураган", "вятър", "пожар", "наводнение"
 ]
 
 HOT_TERMS = [
@@ -189,23 +192,42 @@ def calc_similarity(title1: str, title2: str) -> float:
     return len(intersection) / min(len(set1), len(set2))
 
 def score_entry(title: str, summary: str) -> int:
-    text = normalize((title or "") + " " + (summary or ""))
+    # Normalize title and summary separately
+    t_norm = normalize(title)
+    s_norm = normalize(summary)
+    
     score = 0
     # Boost points for specific high-priority keywords
+    # Title match = 8 pts, Summary match = 4 pts
     priority_boost = [
         "протест", "арест", "корупция", "трагедия", "катастрофа", "криза", "цени",
-        "храна", "поскъпване", "бий", "бой", "полиция", "МВР", "болница"
+        "храна", "поскъпване", "бий", "бой", "полиция", "мвр", "болница"
     ]
     for pb in priority_boost:
-        if pb in text:
-            score += 6  # Substantial boost
+        pb_lower = pb.lower()
+        if pb_lower in t_norm:
+            score += 8
+        elif pb_lower in s_norm:
+            score += 4
 
+    # Standard keywords
+    # Title match = 5 pts, Summary match = 2 pts
     for kw in KEYWORDS:
-        if kw.lower() in text:
-            score += 3
-    for ht in HOT_TERMS:
-        if ht.lower() in text:
+        kw_lower = kw.lower()
+        if kw_lower in t_norm:
+            score += 5
+        elif kw_lower in s_norm:
             score += 2
+            
+    # Hot terms
+    # Title match = 3 pts, Summary match = 1 pt
+    for ht in HOT_TERMS:
+        ht_lower = ht.lower()
+        if ht_lower in t_norm:
+            score += 3
+        elif ht_lower in s_norm:
+            score += 1
+            
     return score
 
 def detect_article_type(source_name: str, title: str, link: str) -> str:
@@ -479,8 +501,8 @@ def generate_post(client: OpenAI, source: str, title: str, summary_raw: str, lin
 
 РЕЛАВАНТНОСТ (КРИТИЧНО):
 1. Новината трябва да се отнася директно за БЪЛГАРИЯ (събития, политици, институции, икономика в България).
-2. АКО НЕ Е за България, тя трябва да бъде за: ВОЙНАТА, РУСИЯ, УКРАЙНА или ДОНАЛД ТРЪМП.
-Ако новината НЕ Е за България и НЕ Е за някоя от тези 4 специфични теми, изобщо не генерирай пост и върни само думата: SKIP.
+2. АКО НЕ Е за България, тя трябва да бъде за: ВОЙНАТА, РУСИЯ, УКРАЙНА, ДОНАЛД ТРЪМП или ПУТИН.
+3. Ако новината НЕ Е за България и НЕ Е за някоя от тези 5 специфични теми, изобщо не генерирай пост и върни само думата: SKIP.
 
 Ако новината е релевантна, ВИНАГИ връщай EXACTLY 4 блока с етикети: HEADLINE, SUMMARY, DETAILS, HASHTAGS. (Без други обяснения).
 
@@ -499,7 +521,7 @@ HASHTAGS: 4-6 релевантни хештага.
     r = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Ти си прецизен филтър и генератор на новини. Първо решаваш дали новината е за България, Русия, Украйна, Тръмп или Войната. Ако не е - връщаш SKIP. Ако е - генерираш пост в 4 блока."},
+            {"role": "system", "content": "Ти си прецизен филтър и генератор на новини. Първо решаваш дали новината е за България, Русия, Украйна, Тръмп, Путин или Войната. Ако не е - връщаш SKIP. Ако е - генерираш пост в 4 блока."},
             {"role": "user", "content": prompt}
         ],
         temperature=OPENAI_TEMPERATURE,
